@@ -1,43 +1,58 @@
 use clap::Parser;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use owo_colors::OwoColorize;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Args {
+    /// Path to inspect
     path: PathBuf,
 
-    #[arg(long)]
+    /// Limit recursion depth
+    #[arg(short = 'd', long)]
     depth: Option<usize>,
 
+    /// Show only directories
     #[arg(long)]
     only_dirs: bool,
 
+    /// Ignore specific files or directories (can be used multiple times)
     #[arg(long)]
-    ignore: Option<String>,
+    ignore: Vec<String>,
 
+    /// Disable colored output
     #[arg(long)]
     no_color: bool,
 
-    /// Show file size
-    #[arg(long)]
+    /// Show file sizes
+    #[arg(short, long)]
     size: bool,
 
     /// Show Unix-style permissions
-    #[arg(long)]
+    #[arg(short, long)]
     permissions: bool,
 }
 
 fn main() {
     let args = Args::parse();
 
-    let use_color = !args.no_color;
+    let use_color = should_use_color(&args);
 
     print_root(&args.path, use_color);
     print_tree(&args.path, "", &args, 0, use_color);
+}
+
+fn should_use_color(args: &Args) -> bool {
+    if args.no_color {
+        return false;
+    }
+
+    use std::io::IsTerminal;
+    std::io::stdout().is_terminal()
 }
 
 fn print_root(path: &PathBuf, use_color: bool) {
@@ -62,39 +77,42 @@ fn print_tree(
         }
     }
 
-    let mut entries: Vec<_> = fs::read_dir(path)
-        .unwrap()
-        .filter_map(Result::ok)
-        .collect();
+    let mut entries: Vec<_> = match fs::read_dir(path) {
+        Ok(e) => e.filter_map(Result::ok).collect(),
+        Err(_) => return,
+    };
 
     entries.sort_by_key(|e| e.path());
 
     for (i, entry) in entries.iter().enumerate() {
         let path = entry.path();
-        let name = path.file_name().unwrap().to_string_lossy();
+        let name = match path.file_name() {
+            Some(n) => n.to_string_lossy(),
+            _none => continue,
+        };
 
-        if let Some(ignore) = &args.ignore {
-            if name == *ignore {
-                continue;
-            }
+        if args.ignore.iter().any(|ig| ig == &name) {
+            continue;
         }
 
         if args.only_dirs && !path.is_dir() {
             continue;
         }
 
-        let metadata = fs::symlink_metadata(&path).unwrap();
-
-        let is_last = i == entries.len() - 1;
-        let connector = if is_last { "└──" } else { "├──" };
-
-        let connector = if use_color {
-            connector.bright_black().to_string()
-        } else {
-            connector.to_string()
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
         };
 
-        // Optional columns
+        let is_last = i == entries.len() - 1;
+        let connector_raw = if is_last { "└──" } else { "├──" };
+
+        let connector = if use_color {
+            connector_raw.bright_black().to_string()
+        } else {
+            connector_raw.to_string()
+        };
+
         let mut columns = String::new();
 
         if args.permissions {
@@ -103,7 +121,11 @@ fn print_tree(
         }
 
         if args.size {
-            let size = human_size(metadata.len());
+            let size = if metadata.is_dir() {
+                human_size(dir_size(&path))
+            } else {
+                human_size(metadata.len())
+            };
             columns.push_str(&format!("{:>8} ", size));
         }
 
@@ -122,6 +144,26 @@ fn print_tree(
         }
     }
 }
+
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0;
+
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if let Ok(metadata) = fs::symlink_metadata(&path) {
+                if metadata.is_dir() {
+                    total += dir_size(&path);
+                } else {
+                    total += metadata.len();
+                }
+            }
+        }
+    }
+
+    total
+}
+
 fn format_permissions(metadata: &fs::Metadata) -> String {
     #[cfg(unix)]
     {
@@ -138,19 +180,19 @@ fn format_permissions(metadata: &fs::Metadata) -> String {
             perms.push(if mode & (0o1 << shift) != 0 { 'x' } else { '-' });
         }
 
-        return perms;
+        perms
     }
 
     #[cfg(not(unix))]
     {
-        // Windows fallback
         if metadata.permissions().readonly() {
-            return String::from("r--r--r--");
+            String::from("r--r--r--")
         } else {
-            return String::from("rw-rw-rw-");
+            String::from("rw-rw-rw-")
         }
     }
 }
+
 fn human_size(size: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut size = size as f64;
@@ -169,7 +211,10 @@ fn style_entry(path: &PathBuf, name: &str, use_color: bool) -> String {
         return name.to_string();
     }
 
-    let metadata = fs::symlink_metadata(path).unwrap();
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(m) => m,
+        Err(_) => return name.to_string(),
+    };
 
     if metadata.file_type().is_symlink() {
         return name.cyan().to_string();
